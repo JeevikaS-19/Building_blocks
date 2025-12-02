@@ -3,6 +3,8 @@ import mediapipe as mp
 import time
 import pymunk
 import pymunk.pygame_util
+import math
+import numpy as np
 
 
 class Shape:
@@ -324,91 +326,262 @@ def rotate_point_3d(point, center, angle_x, angle_y, angle_z):
     return (int(x3 + center[0]), int(y3 + center[1]))
 
 
-def detect_and_adjust_shape(lines, pixels_per_cm):
+def get_unique_points(lines, tolerance=20):
     """
-    Detect if lines form a rectangle/square and adjust them
+    Map raw points to unique IDs based on proximity.
+    Returns:
+        points: List of unique (x, y) tuples
+        point_map: Dict mapping original (x, y) to unique index
+    """
+    unique_points = []
+    point_map = {}
+    
+    # Helper to find close point
+    def find_close_point(pt):
+        for i, unique_pt in enumerate(unique_points):
+            dist = math.sqrt((pt[0] - unique_pt[0])**2 + (pt[1] - unique_pt[1])**2)
+            if dist < tolerance:
+                return i
+        return -1
+
+    for pt1, pt2, _ in lines:
+        # Check pt1
+        idx1 = find_close_point(pt1)
+        if idx1 == -1:
+            unique_points.append(pt1)
+            idx1 = len(unique_points) - 1
+        point_map[pt1] = idx1
+        
+        # Check pt2
+        idx2 = find_close_point(pt2)
+        if idx2 == -1:
+            unique_points.append(pt2)
+            idx2 = len(unique_points) - 1
+        point_map[pt2] = idx2
+            
+    return unique_points, point_map
+
+def build_adjacency_graph(lines, tolerance=20):
+    """
+    Build a graph where nodes are points and edges are lines.
+    Returns:
+        adj: Dict mapping point_index -> list of (neighbor_index, line_index)
+        unique_points: List of unique point coordinates
+    """
+    unique_points, point_map = get_unique_points(lines, tolerance)
+    adj = {i: [] for i in range(len(unique_points))}
+    
+    for line_idx, (pt1, pt2, _) in enumerate(lines):
+        idx1 = point_map[pt1]
+        idx2 = point_map[pt2]
+        
+        if idx1 != idx2: # Ignore zero-length lines
+            adj[idx1].append((idx2, line_idx))
+            adj[idx2].append((idx1, line_idx))
+            
+    return adj, unique_points
+
+def find_closed_loop(lines):
+    """
+    Find a set of lines that form a closed loop where every point has degree 2.
+    Returns:
+        loop_lines: List of lines forming the loop (or None)
+        loop_indices: Indices of these lines in the original list (or None)
+        shape_type: String describing the shape (Triangle, Quad, Polygon)
+    """
+    if len(lines) < 3:
+        return None, None, None
+        
+    adj, unique_points = build_adjacency_graph(lines)
+    
+    # Find connected components
+    visited = set()
+    components = []
+    
+    for i in range(len(unique_points)):
+        if i not in visited:
+            component_nodes = []
+            stack = [i]
+            visited.add(i)
+            while stack:
+                node = stack.pop()
+                component_nodes.append(node)
+                for neighbor, _ in adj[node]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        stack.append(neighbor)
+            components.append(component_nodes)
+            
+    # Check each component
+    for comp in components:
+        if len(comp) < 3:
+            continue
+            
+        # Check degrees
+        is_closed_loop = True
+        comp_lines_indices = set()
+        
+        for node in comp:
+            # In a simple closed polygon, every node must have degree 2
+            # Note: This handles simple polygons. Complex ones with intersections might fail this simple check.
+            degree = len(adj[node])
+            if degree != 2:
+                is_closed_loop = False
+                break
+            
+            # Collect line indices
+            for _, line_idx in adj[node]:
+                comp_lines_indices.add(line_idx)
+        
+        if is_closed_loop:
+            # We found a loop!
+            loop_indices = sorted(list(comp_lines_indices))
+            loop_lines = [lines[i] for i in loop_indices]
+            
+            num_sides = len(loop_lines)
+            shape_type = "POLYGON"
+            if num_sides == 3:
+                shape_type = "TRIANGLE"
+            elif num_sides == 4:
+                shape_type = "QUAD" # Could be rect, square, or generic quad
+                
+            return loop_lines, loop_indices, shape_type
+            
+    return None, None, None
+
+def order_loop_points(lines, tolerance=20):
+    """
+    Given a set of lines forming a closed loop, return the ordered vertices.
+    """
+    if not lines:
+        return []
+        
+    # Get unique points to handle connectivity
+    unique_points, point_map = get_unique_points(lines, tolerance)
+    
+    # Build adjacency for this specific set of lines
+    # map point_idx -> list of (neighbor_idx, line_idx)
+    adj = {i: [] for i in range(len(unique_points))}
+    for line_idx, (pt1, pt2, _) in enumerate(lines):
+        idx1 = point_map[pt1]
+        idx2 = point_map[pt2]
+        adj[idx1].append(idx2)
+        adj[idx2].append(idx1)
+        
+    # Traverse
+    ordered_indices = []
+    start_node = 0 # Start with first unique point
+    curr = start_node
+    visited = {curr}
+    ordered_indices.append(curr)
+    
+    # We expect a simple cycle
+    while len(ordered_indices) < len(unique_points):
+        # Find unvisited neighbor
+        found = False
+        for neighbor in adj[curr]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                ordered_indices.append(neighbor)
+                curr = neighbor
+                found = True
+                break
+        if not found:
+            break
+            
+    # Convert indices back to points
+    ordered_points = [unique_points[i] for i in ordered_indices]
+    return ordered_points
+
+def adjust_rectangle_if_applicable(lines, pixels_per_cm):
+    """
+    If the lines form a 4-sided shape that looks like a rectangle, adjust it.
+    Otherwise return the lines as-is (but ordered).
     
     Args:
-        lines: List of (pt1, pt2, dist) tuples
+        lines: List of 4 lines
         pixels_per_cm: Calibration value
         
     Returns:
-        New list of lines forming the perfect shape, or None if no shape detected
+        adjusted_lines: List of 4 lines (adjusted or original)
+        shape_type: "SQUARE", "RECTANGLE", or "QUAD"
     """
-    if len(lines) != 4 or pixels_per_cm is None:
-        return None
+    if len(lines) != 4:
+        return lines, "POLYGON"
         
-    # Extract all points
+    # Per user request: "when it's a polygon, keep the shape as it was drawn, don't auto-adjust"
+    # We will disable the auto-adjustment for now and just return the original lines as a QUAD.
+    return lines, "QUAD"
+    
+    # Original logic commented out below:
+    """
+    # Extract points
     points = []
     for pt1, pt2, _ in lines:
         points.append(pt1)
         points.append(pt2)
-    
-    # We should have 4 unique points (approx) for a closed quad
-    # But since we snap points, we might have exactly 4 unique points if drawn perfectly
-    # Or up to 8 if not connected perfectly. 
-    # Let's simplify: find bounding box of all points
+        
+    # Get bounding box
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
-    
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
     
     width_px = max_x - min_x
     height_px = max_y - min_y
     
-    width_cm = width_px / pixels_per_cm
-    height_cm = height_px / pixels_per_cm
+    # Check if it's axis-aligned enough to be a rectangle
+    # We can check if the area of bounding box is close to area of polygon
+    # Or simpler: check if width/height ratio is reasonable and lines are roughly horizontal/vertical
+    # For now, let's use the existing logic but be more permissive since we already know it's a closed loop
     
-    # Check if it's roughly a closed loop (start/end points match up)
-    # This is a simplification - we assume if user drew 4 lines they intended a shape
-    
-    # Determine shape type
-    diff_cm = abs(width_cm - height_cm)
-    
-    new_width_cm = 0
-    new_height_cm = 0
-    shape_type = ""
-    
-    if diff_cm < 2.0:
-        # It's a SQUARE
-        shape_type = "SQUARE"
-        # Average the sides
-        avg_side_cm = round((width_cm + height_cm) / 2)
-        new_width_cm = avg_side_cm
-        new_height_cm = avg_side_cm
-    else:
-        # It's a RECTANGLE
-        shape_type = "RECTANGLE"
-        new_width_cm = round(width_cm)
-        new_height_cm = round(height_cm)
+    if pixels_per_cm:
+        width_cm = width_px / pixels_per_cm
+        height_cm = height_px / pixels_per_cm
         
-    # Convert back to pixels
-    new_width_px = int(new_width_cm * pixels_per_cm)
-    new_height_px = int(new_height_cm * pixels_per_cm)
-    
-    # Center the new shape
-    center_x = (min_x + max_x) // 2
-    center_y = (min_y + max_y) // 2
-    
-    half_w = new_width_px // 2
-    half_h = new_height_px // 2
-    
-    # New corners
-    tl = (center_x - half_w, center_y - half_h)
-    tr = (center_x + half_w, center_y - half_h)
-    br = (center_x + half_w, center_y + half_h)
-    bl = (center_x - half_w, center_y + half_h)
-    
-    # Create new lines
-    new_lines = [
-        (tl, tr, new_width_cm),
-        (tr, br, new_height_cm),
-        (br, bl, new_width_cm),
-        (bl, tl, new_height_cm)
-    ]
-    
-    return new_lines, shape_type
+        diff_cm = abs(width_cm - height_cm)
+        
+        # Heuristic: If it's a quad, let's see if we should snap it to a rect/square
+        # We'll assume if the user drew a closed 4-sided loop, they might want a rect
+        # UNLESS it's clearly a diamond or trapezium. 
+        # For this iteration, let's ALWAYS try to snap to rect/square for 4 sides
+        # as that preserves the original behavior for boxes.
+        
+        shape_type = ""
+        new_width_cm = 0
+        new_height_cm = 0
+        
+        if diff_cm < 2.0:
+            shape_type = "SQUARE"
+            avg_side = (width_cm + height_cm) / 2
+            new_width_cm = avg_side
+            new_height_cm = avg_side
+        else:
+            shape_type = "RECTANGLE"
+            new_width_cm = width_cm
+            new_height_cm = height_cm
+            
+        # Reconstruct perfect rect
+        center_x = (min_x + max_x) // 2
+        center_y = (min_y + max_y) // 2
+        half_w = int(new_width_cm * pixels_per_cm / 2)
+        half_h = int(new_height_cm * pixels_per_cm / 2)
+        
+        tl = (center_x - half_w, center_y - half_h)
+        tr = (center_x + half_w, center_y - half_h)
+        br = (center_x + half_w, center_y + half_h)
+        bl = (center_x - half_w, center_y + half_h)
+        
+        new_lines = [
+            (tl, tr, new_width_cm),
+            (tr, br, new_height_cm),
+            (br, bl, new_width_cm),
+            (bl, tl, new_height_cm)
+        ]
+        return new_lines, shape_type
+        
+    return lines, "QUAD"
+    """
 
 
 
@@ -687,55 +860,77 @@ def main():
                 finalized_lines.append((locked_point_1, straightened_point_2, distance_cm))
                 print(f"Line FINALIZED: {len(finalized_lines)} total lines")
                 
-                # Check for shape detection (every 4 lines - multiples of 4)
-                if len(finalized_lines) % 4 == 0 and len(finalized_lines) > 0:
-                    # Take the last 4 lines
-                    last_four_lines = finalized_lines[-4:]
-                    result = detect_and_adjust_shape(last_four_lines, pixels_per_cm)
-                    if result:
-                        new_lines, shape_type = result
-                        # Replace the last 4 lines with the adjusted shape
-                        finalized_lines = finalized_lines[:-4] + new_lines
-                        print(f"Shape Detected: {shape_type} - Adjusted lines")
+                # Check for closed shape detection
+                loop_lines, loop_indices, shape_type = find_closed_loop(finalized_lines)
+                
+                if loop_lines:
+                    # If it's a quad, try to adjust it to a rectangle/square
+                    final_shape_lines = loop_lines
+                    if shape_type == "QUAD":
+                        adjusted_lines, specific_type = adjust_rectangle_if_applicable(loop_lines, pixels_per_cm)
+                        final_shape_lines = adjusted_lines
+                        shape_type = specific_type
+                    
+                    print(f"Shape Detected: {shape_type}")
+                    
+                    # Create Shape object
+                    # Extract ordered points from lines
+                    ordered_points = []
+                    # We need to order them correctly. The loop_lines might not be in order.
+                    # But find_closed_loop returns lines based on graph traversal, so they should be connected.
+                    # Let's trace the path from the first line
+                    
+                    # Simple approach: just take points from lines. 
+                    # Since adjust_rectangle_if_applicable returns ordered lines for quads, we are good there.
+                    # For general polygons, we might need to ensure order.
+                    # Let's assume for now loop_lines are somewhat ordered or we just take vertices.
+                    
+                    # Better: Re-extract points from the lines to ensure they form a sequence
+                    # For adjusted quads, they are definitely ordered (tl->tr->br->bl)
+                    if shape_type in ["SQUARE", "RECTANGLE"]:
+                         ordered_points = [final_shape_lines[0][0], final_shape_lines[1][0], final_shape_lines[2][0], final_shape_lines[3][0]]
+                    else:
+                        # For generic polygons, use the helper to get ordered vertices
+                        ordered_points = order_loop_points(final_shape_lines)
+
+                    active_shape = Shape(ordered_points)
+                    shapes.append(active_shape)
+                    
+                    # Remove used lines from finalized_lines
+                    # We must remove by index, starting from largest to avoid shifting issues
+                    for idx in sorted(loop_indices, reverse=True):
+                        finalized_lines.pop(idx)
+                    
+                    # Show notification
+                    cv2.putText(img, f"{shape_type} DETECTED!", 
+                               (img.shape[1]//2 - 150, img.shape[0]//2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+                    cv2.imshow("Hand Gesture Drawing", img)
+                    cv2.waitKey(1000) # Show for 1 second
+                    
+                    # ENTER ROTATION MODE
+                    rotation_mode = True
+                    base_rotation_angle = 0
+                    current_rotation_angle = 0
+                    initial_thumb_index_angle = None
+                    
+                    # Calculate center of shape (initial pivot)
+                    xs = [p[0] for p in active_shape.points]
+                    ys = [p[1] for p in active_shape.points]
+                    initial_center_x = (min(xs) + max(xs)) // 2
+                    initial_center_y = (min(ys) + max(ys)) // 2
+                    
+                    # Calculate OFFSETS from center for each point
+                    # This allows us to reconstruct the shape around ANY new center (like the thumb)
+                    shape_offsets = []
+                    for pt in active_shape.points:
+                        off = (pt[0] - initial_center_x, pt[1] - initial_center_y)
+                        shape_offsets.append(off)
                         
-                        # Create Shape object
-                        ordered_points = [new_lines[0][0], new_lines[1][0], new_lines[2][0], new_lines[3][0]]
-                        active_shape = Shape(ordered_points)
-                        shapes.append(active_shape)
-                        
-                        # Remove these lines from finalized_lines as they are now part of a Shape
-                        finalized_lines = finalized_lines[:-4]
-                        
-                        # Show notification
-                        cv2.putText(img, f"{shape_type} DETECTED!", 
-                                   (img.shape[1]//2 - 150, img.shape[0]//2),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
-                        cv2.imshow("Hand Gesture Drawing", img)
-                        cv2.waitKey(1000) # Show for 1 second
-                        
-                        # ENTER ROTATION MODE
-                        rotation_mode = True
-                        base_rotation_angle = 0
-                        current_rotation_angle = 0
-                        initial_thumb_index_angle = None
-                        
-                        # Calculate center of shape (initial pivot)
-                        xs = [p[0] for p in active_shape.points]
-                        ys = [p[1] for p in active_shape.points]
-                        initial_center_x = (min(xs) + max(xs)) // 2
-                        initial_center_y = (min(ys) + max(ys)) // 2
-                        
-                        # Calculate OFFSETS from center for each point
-                        # This allows us to reconstruct the shape around ANY new center (like the thumb)
-                        shape_offsets = []
-                        for pt in active_shape.points:
-                            off = (pt[0] - initial_center_x, pt[1] - initial_center_y)
-                            shape_offsets.append(off)
-                            
-                        print(f"Entering Rotation Mode. Shape pinned to Thumb.")
-                        
-                        # Add a frame counter to prevent immediate exit
-                        rotation_entry_frame = 0
+                    print(f"Entering Rotation Mode. Shape pinned to Thumb.")
+                    
+                    # Add a frame counter to prevent immediate exit
+                    rotation_entry_frame = 0
                 
                 # Clear current locked points for next line
                 locked_point_1 = None
@@ -959,66 +1154,6 @@ def main():
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
         
         # Display status information
-        status_y = img.shape[0] - 60
-        
-        # Show locked points status
-        status_text = f"Lines: {len(finalized_lines)} | "
-        
-        if rotation_mode:
-            status_text += "ROTATION MODE - Left Thumb/Index to Rotate - Thumbs Up to Finish"
-        elif locked_point_1 is not None and locked_point_2 is not None:
-            status_text += "Line drawn - THUMBS UP to finalize"
-        elif locked_point_1 is not None:
-            status_text += "Point 1 LOCKED - Pinch Right for Point 2"
-        elif locked_point_2 is not None:
-            status_text += "Point 2 LOCKED - Pinch Left for Point 1"
-        else:
-            status_text += "Pinch to set points"
-        
-        cv2.putText(img, status_text, (10, status_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Display instructions and calibration status
-        instruction_text = "Thumbs Up: Finalize | 'U': Undo | 'C': Clear All | 'Q': Quit"
-        if pixels_per_cm is not None:
-            instruction_text += f" | Cal: {pixels_per_cm:.1f} px/cm"
-        cv2.putText(img, instruction_text, 
-                   (10, img.shape[0] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Update thumbs up state for next frame
-        thumbs_up_was_detected = thumbs_up_detected
-        
-        # Show the image
-        cv2.imshow("Hand Gesture Drawing", img)
-        
-        # Handle keyboard input
-        key = cv2.waitKey(1) & 0xFF
-        
-        # Exit on 'q' key
-        if key == ord('q'):
-            break
-        # Undo last line on 'u' key
-        elif key == ord('u'):
-            if finalized_lines:
-                finalized_lines.pop()
-                print("Last line undone!")
-            else:
-                print("No lines to undo")
-        # Clear locked points on 'c' key
-        elif key == ord('c'):
-            locked_point_1 = None
-            locked_point_2 = None
-            finalized_lines = []
-            
-            # Remove all shapes from physics space
-            for shape in shapes:
-                if shape.body:
-                    space.remove(shape.body, shape.poly)
-            shapes = []
-            
-            print("All lines and shapes cleared!")
-        
         # Draw finalized lines
         for line in finalized_lines:
             point1, point2, distance_cm = line
@@ -1107,12 +1242,15 @@ def main():
         
         # Calculate and display FPS
         curr_time = time.time()
-        fps = 1 / (curr_time - prev_time)
+        time_diff = curr_time - prev_time
+        if time_diff > 0:
+            fps = 1 / time_diff
+        else:
+            fps = 0
         prev_time = curr_time
         cv2.putText(img, f"FPS: {int(fps)}", (10, 40), 
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
         
-        # Display status information
         status_y = img.shape[0] - 60
         
         # Show locked points status
@@ -1172,6 +1310,7 @@ def main():
             shapes = []
             
             print("All lines and shapes cleared!")
+        
     
     # Cleanup
     cap.release()
